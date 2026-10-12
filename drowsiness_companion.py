@@ -12,7 +12,7 @@ import urllib.request
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("GLOG_minloglevel", "2")       # hide MediaPipe's startup chatter
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 import cv2
@@ -20,21 +20,21 @@ import numpy as np
 import mediapipe as mp
 
 # ---------------------------------------------------------------- tunables
-CALIBRATION_SEC = 3.0  # look at the camera with eyes open during this
-EAR_RATIO = 0.70  # eyes "closed" when EAR < 70% of your open-eye EAR
-EYE_SIGN_SEC = 1.2  # eyes closed this long = drowsiness sign (long blink)
-EYE_ALARM_SEC = 2.5  # eyes closed this long = immediate alarm
-MAR_YAWN = 0.55  # mouth aspect ratio above this = mouth wide open
-YAWN_SEC = 1.0  # mouth open this long = yawn
-NOD_DELTA = 0.07  # head pitched down this much past baseline = nodding
-NOD_SEC = 0.8  # held this long = head nod
-ESCALATE_WINDOW = 60.0  # another sign within this many s after a nudge -> alarm
-BANNER_SEC = 4.0  # how long the Nudge / Alert stage stays lit
+CALIBRATION_SEC = 3.0      # look at the camera with eyes open during this
+EAR_RATIO = 0.70           # eyes "closed" when EAR < 70% of your open-eye EAR
+EYE_SIGN_SEC = 1.2         # eyes closed this long = drowsiness sign (long blink)
+EYE_ALARM_SEC = 2.5        # eyes closed this long = immediate alarm
+MAR_YAWN = 0.55            # mouth aspect ratio above this = mouth wide open
+YAWN_SEC = 1.0             # mouth open this long = yawn
+NOD_DELTA = 0.07           # head pitched down this much past baseline = nodding
+NOD_SEC = 0.8              # held this long = head nod
+ESCALATE_WINDOW = 60.0     # another sign within this many s after a nudge -> alarm
+BANNER_SEC = 4.0           # how long the Nudge / Alert stage stays lit
 
-NUDGE_TEXT = "Hey, you look tired. Time for a break?"
+VERSION = "v3"
 
 # MediaPipe Face Mesh landmark indices
-LEFT_EYE = [33, 160, 158, 133, 153, 144]  # p1..p6 for EAR
+LEFT_EYE = [33, 160, 158, 133, 153, 144]    # p1..p6 for EAR
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 MOUTH_CORNERS = (78, 308)
 MOUTH_PAIRS = [(13, 14), (81, 178), (311, 402)]  # upper/lower inner lip
@@ -67,8 +67,23 @@ def head_pitch_ratio(pts):
 def make_alarm_wav(path, seconds=2.0, rate=22050):
     t = np.arange(int(seconds * rate)) / rate
     freq = np.where((t * 4).astype(int) % 2 == 0, 880, 1320)
-    on = (t * 8).astype(int) % 2 == 0
+    on = ((t * 8).astype(int) % 2 == 0)
     samples = (0.9 * 32767 * np.sin(2 * np.pi * freq * t) * on).astype(np.int16)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(samples.tobytes())
+
+
+def make_chime_wav(path, rate=22050):
+    t = np.arange(int(1.9 * rate)) / rate
+    out = np.zeros_like(t)
+    for freq, start in ((784, 0.0), (659, 0.35)):
+        tt = np.clip(t - start, 0, None)
+        env = np.where(t >= start, np.exp(-tt * 3.5), 0)
+        out += env * (np.sin(2 * np.pi * freq * tt) + 0.2 * np.sin(4 * np.pi * freq * tt))
+    samples = (0.4 * 32767 * out / np.abs(out).max()).astype(np.int16)
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
@@ -78,27 +93,25 @@ def make_alarm_wav(path, seconds=2.0, rate=22050):
 
 class PiAudio:
     def __init__(self):
-        self.alarm_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "alarm.wav"
-        )
+        here = os.path.dirname(os.path.abspath(__file__))
+        self.alarm_path = os.path.join(here, "alarm.wav")
+        self.chime_path = os.path.join(here, "chime.wav")
         if not os.path.exists(self.alarm_path):
             make_alarm_wav(self.alarm_path)
+        if not os.path.exists(self.chime_path):
+            make_chime_wav(self.chime_path)
         self.proc = None
 
     def _run(self, cmd):
         try:
             if self.proc is not None and self.proc.poll() is None:
                 self.proc.terminate()
-            self.proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
-            print(
-                f"[pi-audio] '{cmd[0]}' not found - sudo apt install espeak-ng alsa-utils"
-            )
+            print(f"[pi-audio] '{cmd[0]}' not found - sudo apt install alsa-utils")
 
-    def say(self, text):
-        self._run(["espeak-ng", "-s", "145", "-a", "170", text])
+    def chime(self):
+        self._run(["aplay", "-q", self.chime_path])
 
     def alarm(self):
         self._run(["aplay", "-q", self.alarm_path])
@@ -159,13 +172,9 @@ def open_camera(index):
     return cap
 
 
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
-    "face_landmarker/float16/1/face_landmarker.task"
-)
-MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task"
-)
+MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+             "face_landmarker/float16/1/face_landmarker.task")
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
 
 
 def ensure_model():
@@ -176,11 +185,9 @@ def ensure_model():
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH + ".part")
         os.replace(MODEL_PATH + ".part", MODEL_PATH)
     except Exception as e:
-        raise SystemExit(
-            f"Could not download the face model ({e}).\n"
-            f"Connect the Pi to the internet once, or download\n  {MODEL_URL}\n"
-            f"on the laptop and copy it next to this script as face_landmarker.task"
-        )
+        raise SystemExit(f"Could not download the face model ({e}).\n"
+                         f"Connect the Pi to the internet once, or download\n  {MODEL_URL}\n"
+                         f"on the laptop and copy it next to this script as face_landmarker.task")
     return MODEL_PATH
 
 
@@ -189,15 +196,13 @@ class FaceTracker:
 
     def __init__(self):
         from mediapipe.tasks.python import BaseOptions, vision
-
         opts = vision.FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=ensure_model()),
             running_mode=vision.RunningMode.VIDEO,
             num_faces=1,
             min_face_detection_confidence=0.5,
             min_face_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+            min_tracking_confidence=0.5)
         self.lm = vision.FaceLandmarker.create_from_options(opts)
         self.last_ts = 0
 
@@ -207,9 +212,7 @@ class FaceTracker:
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         ts = max(int(time.monotonic() * 1000), self.last_ts + 1)
         self.last_ts = ts
-        res = self.lm.detect_for_video(
-            mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts
-        )
+        res = self.lm.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts)
         if not res.face_landmarks:
             return None
         return [(p.x * w, p.y * h) for p in res.face_landmarks[0]]
@@ -236,12 +239,12 @@ class Detector:
         self.nudges += 1
         self.last_nudge, self.nudge_until = now, now + BANNER_SEC
         self.hub.log(f"Nudge: {reason}", "nudge")
-        self.hub.push({"type": "nudge", "text": NUDGE_TEXT, "reason": reason})
+        self.hub.push({"type": "nudge", "reason": reason})
         if self.pi_audio:
-            self.pi_audio.say(NUDGE_TEXT)
+            self.pi_audio.chime()
 
     def alert(self, now, reason):
-        if now - self.last_alert < 2.5:  # an alarm is already sounding
+        if now - self.last_alert < 2.5:   # an alarm is already sounding
             return
         self.last_alert = now
         self.alerts += 1
@@ -302,25 +305,18 @@ class Detector:
             ear = mar = pitch = None
             eyes_closed = False
             if face:
-                ear = (
-                    eye_aspect_ratio(pts, LEFT_EYE) + eye_aspect_ratio(pts, RIGHT_EYE)
-                ) / 2
+                ear = (eye_aspect_ratio(pts, LEFT_EYE) + eye_aspect_ratio(pts, RIGHT_EYE)) / 2
                 mar = mouth_aspect_ratio(pts)
                 pitch = head_pitch_ratio(pts)
 
                 if self.ear_thresh is None:
                     self.calib_ear.append(ear)
                     self.calib_pitch.append(pitch)
-                    if (
-                        now - self.calib_start >= CALIBRATION_SEC
-                        and len(self.calib_ear) > 10
-                    ):
+                    if now - self.calib_start >= CALIBRATION_SEC and len(self.calib_ear) > 10:
                         self.open_ear = float(np.median(self.calib_ear))
                         self.ear_thresh = self.open_ear * EAR_RATIO
                         self.pitch_base = float(np.median(self.calib_pitch))
-                        hub.log(
-                            f"Calibrated (open-eye EAR {self.open_ear:.2f}). Watching."
-                        )
+                        hub.log(f"Calibrated (open-eye EAR {self.open_ear:.2f}). Watching.")
                 else:
                     self._detect(now, ear, mar, pitch)
                     eyes_closed = self.closed_since is not None
@@ -332,20 +328,8 @@ class Detector:
 
             if self.ear_thresh is None:
                 left = max(0.0, CALIBRATION_SEC - (now - self.calib_start))
-                txt = (
-                    f"Calibrating... {left:.1f}s"
-                    if face
-                    else "Calibrating: no face in view"
-                )
-                cv2.putText(
-                    frame,
-                    txt,
-                    (14, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (255, 255, 255),
-                    2,
-                )
+                txt = f"Calibrating... {left:.1f}s" if face else "Calibrating: no face in view"
+                cv2.putText(frame, txt, (14, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
             ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
             if ok:
@@ -369,9 +353,7 @@ class Detector:
                 f["eye_sign"] = True
                 self.on_sign(now, f"eyes closed {d:.1f} s")
             if d >= EYE_ALARM_SEC and now - self.last_alert >= 3.0:
-                self.alert(
-                    now, f"eyes closed {d:.1f} s"
-                )  # repeats while eyes stay shut
+                self.alert(now, f"eyes closed {d:.1f} s")   # repeats while eyes stay shut
         else:
             self.closed_since = None
             f["eye_sign"] = False
@@ -403,15 +385,8 @@ class Detector:
             txt = f"Eyes closed: {now - self.closed_since:.1f} s"
             (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             cv2.rectangle(frame, (x0, y1 + 4), (x0 + tw + 12, y1 + th + 16), color, -1)
-            cv2.putText(
-                frame,
-                txt,
-                (x0 + 6, y1 + th + 9),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2,
-            )
+            cv2.putText(frame, txt, (x0 + 6, y1 + th + 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
     def _metrics(self, now, has_face, ear, mar, pitch, fps):
         if self.ear_thresh is None:
@@ -422,11 +397,8 @@ class Detector:
             stage = "nudge"
         elif not has_face:
             stage = "noface"
-        elif (
-            (self.closed_since and now - self.closed_since > 0.4)
-            or self.yawn_since
-            or self.nod_since
-        ):
+        elif ((self.closed_since and now - self.closed_since > 0.4)
+              or self.yawn_since or self.nod_since):
             stage = "detect"
         else:
             stage = "watch"
@@ -435,16 +407,12 @@ class Detector:
             "type": "metrics",
             "stage": stage,
             "face": has_face,
-            "calib_left": round(
-                max(0.0, CALIBRATION_SEC - (now - self.calib_start)), 1
-            ),
+            "calib_left": round(max(0.0, CALIBRATION_SEC - (now - self.calib_start)), 1),
             "closed": round(now - self.closed_since, 1) if self.closed_since else 0,
             "eye": round(ear / self.open_ear, 3) if calibrated else None,
             "eye_thr": EAR_RATIO,
             "mouth": round(mar / MAR_YAWN, 3) if calibrated else None,
-            "head": round((pitch - self.pitch_base) / NOD_DELTA, 3)
-            if calibrated
-            else None,
+            "head": round((pitch - self.pitch_base) / NOD_DELTA, 3) if calibrated else None,
             "fps": round(fps, 1),
             "nudges": self.nudges,
             "alerts": self.alerts,
@@ -468,7 +436,7 @@ def make_handler(hub):
         def do_GET(self):
             path = self.path.split("?")[0]
             if path in ("/", "/index.html"):
-                self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+                self._send(200, PAGE.replace("__VERSION__", VERSION).encode(), "text/html; charset=utf-8")
             elif path == "/stream":
                 self._stream()
             elif path == "/events":
@@ -481,8 +449,8 @@ def make_handler(hub):
             if path == "/api/recalibrate":
                 hub.recalibrate.set()
             elif path == "/api/test-nudge":
-                hub.log("Test: voice nudge", "nudge")
-                hub.push({"type": "nudge", "text": NUDGE_TEXT, "reason": "test"})
+                hub.log("Test: nudge chime", "nudge")
+                hub.push({"type": "nudge", "reason": "test"})
             elif path == "/api/test-alert":
                 hub.log("Test: alarm", "alert")
                 hub.push({"type": "alert", "reason": "test"})
@@ -492,9 +460,7 @@ def make_handler(hub):
 
         def _stream(self):
             self.send_response(200)
-            self.send_header(
-                "Content-Type", "multipart/x-mixed-replace; boundary=frame"
-            )
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             fid = -1
@@ -503,13 +469,8 @@ def make_handler(hub):
                     fid, jpg = hub.wait_frame(fid)
                     if jpg is None:
                         continue
-                    self.wfile.write(
-                        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                        + str(len(jpg)).encode()
-                        + b"\r\n\r\n"
-                        + jpg
-                        + b"\r\n"
-                    )
+                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                     + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
@@ -537,9 +498,7 @@ def make_handler(hub):
 def local_addresses():
     addrs = []
     try:
-        out = subprocess.run(
-            ["hostname", "-I"], capture_output=True, text=True, timeout=2
-        ).stdout
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=2).stdout
         addrs = [a for a in out.split() if "." in a]
     except Exception:
         pass
@@ -550,9 +509,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=int, default=0, help="camera index (default 0)")
     ap.add_argument("--port", type=int, default=8000, help="web port (default 8000)")
-    ap.add_argument(
-        "--pi-audio", action="store_true", help="also play sounds on the Pi"
-    )
+    ap.add_argument("--pi-audio", action="store_true", help="also play sounds on the Pi")
     args = ap.parse_args()
 
     hub = Hub()
@@ -561,7 +518,7 @@ def main():
 
     server = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(hub))
     server.daemon_threads = True
-    print("\nDrowsiness Companion is running. Open on the laptop:")
+    print(f"\nDrowsiness Companion {VERSION} is running. Open on the laptop:")
     print(f"   http://{socket.gethostname()}.local:{args.port}")
     for a in local_addresses():
         print(f"   http://{a}:{args.port}")
@@ -642,7 +599,7 @@ button:hover{border-color:var(--navy)}
 <body>
 <button id="start"><div><b>Click to start</b>This lets the laptop speakers play the nudge chime and the alarm.</div></button>
 <header>
-  <h1>Drowsiness Companion<small>Raspberry Pi 5 &middot; live</small></h1>
+  <h1>Drowsiness Companion</h1>
   <div class="conn"><span class="dot" id="dot"></span><span id="conn">Connecting&hellip;</span></div>
 </header>
 <main>
@@ -687,28 +644,13 @@ button:hover{border-color:var(--navy)}
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let actx = null, voice = null, bubbleTimer = null;
-
-function pickVoice(){
-  const vs = speechSynthesis.getVoices().filter(v => v.lang && v.lang.startsWith('en'));
-  voice = vs.find(v => v.localService) || vs[0] || null;
-}
-if ('speechSynthesis' in window){ speechSynthesis.onvoiceschanged = pickVoice; pickVoice(); }
+let actx = null, bubbleTimer = null;
 
 $('start').onclick = () => {
   try { actx = new (window.AudioContext || window.webkitAudioContext)(); actx.resume(); } catch(e){}
-  try { speechSynthesis.speak(new SpeechSynthesisUtterance(' ')); } catch(e){}
   $('start').remove();
 };
 
-function speak(text){
-  try {
-    speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.rate = 0.95; u.volume = 1; if (voice) u.voice = voice;
-    speechSynthesis.speak(u);
-  } catch(e){}
-}
 function chime(){
   // soft two-note "ding-dong", bell-like: sine + quiet overtone, gentle fade out
   if (!actx) return;
@@ -727,7 +669,6 @@ function chime(){
 }
 function siren(sec){
   if (!actx) return;
-  try { speechSynthesis.cancel(); } catch(e){}
   const o = actx.createOscillator(), g = actx.createGain(), t0 = actx.currentTime;
   o.type = 'square'; g.gain.value = 0.25;
   o.connect(g).connect(actx.destination);
@@ -805,4 +746,3 @@ $('talert').onclick = () => post('/api/test-alert');
 
 if __name__ == "__main__":
     main()
-
