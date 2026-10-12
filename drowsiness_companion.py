@@ -12,6 +12,9 @@ import urllib.request
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -637,7 +640,7 @@ button:hover{border-color:var(--navy)}
 #start b{display:block;font-size:22px;color:var(--navy);margin-bottom:6px}
 </style></head>
 <body>
-<button id="start"><div><b>Click to start</b>This lets the laptop speakers play the voice nudge and the alarm.</div></button>
+<button id="start"><div><b>Click to start</b>This lets the laptop speakers play the nudge chime and the alarm.</div></button>
 <header>
   <h1>Drowsiness Companion<small>Raspberry Pi 5 &middot; live</small></h1>
   <div class="conn"><span class="dot" id="dot"></span><span id="conn">Connecting&hellip;</span></div>
@@ -655,7 +658,7 @@ button:hover{border-color:var(--navy)}
       <div class="stages">
         <div class="stage watch" id="s-watch"><span class="n">1</span><b>Watch</b><span>Tracking face and eyes</span></div>
         <div class="stage detect" id="s-detect"><span class="n">2</span><b>Detect</b><span>Long blink, yawn, nod</span></div>
-        <div class="stage nudge" id="s-nudge"><span class="n">3</span><b>Nudge</b><span>&ldquo;Time for a break?&rdquo;</span></div>
+        <div class="stage nudge" id="s-nudge"><span class="n">3</span><b>Nudge</b><span>Soft chime</span></div>
         <div class="stage alert" id="s-alert"><span class="n">4</span><b>Alert</b><span>Loud alarm</span></div>
       </div>
     </div>
@@ -676,7 +679,7 @@ button:hover{border-color:var(--navy)}
     </div>
     <div class="btns">
       <button id="recal">Recalibrate</button>
-      <button id="tnudge">Test voice</button>
+      <button id="tnudge">Test nudge</button>
       <button id="talert">Test alarm</button>
       <span class="conn" id="fps" style="align-self:center;margin-left:auto"></span>
     </div>
@@ -705,6 +708,22 @@ function speak(text){
     u.rate = 0.95; u.volume = 1; if (voice) u.voice = voice;
     speechSynthesis.speak(u);
   } catch(e){}
+}
+function chime(){
+  // soft two-note "ding-dong", bell-like: sine + quiet overtone, gentle fade out
+  if (!actx) return;
+  const t0 = actx.currentTime;
+  [[784, 0], [659, 0.35]].forEach(([f, dt]) => {
+    [[f, 0.32], [f * 2, 0.06]].forEach(([freq, vol]) => {
+      const o = actx.createOscillator(), g = actx.createGain(), t = t0 + dt;
+      o.type = 'sine'; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(vol, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 1.4);
+      o.connect(g).connect(actx.destination);
+      o.start(t); o.stop(t + 1.5);
+    });
+  });
 }
 function siren(sec){
   if (!actx) return;
@@ -769,7 +788,7 @@ es.onmessage = e => {
   const ev = JSON.parse(e.data);
   if (ev.type === 'metrics') onMetrics(ev);
   else if (ev.type === 'log') addLog(ev);
-  else if (ev.type === 'nudge'){ speak(ev.text); bubble('nudge', 'Hey, you look tired.', 'Time for a break?'); }
+  else if (ev.type === 'nudge'){ chime(); bubble('nudge', 'Hey, you look tired.', 'Time for a break?'); }
   else if (ev.type === 'alert'){ siren(2.5); bubble('alert', 'WAKE UP!', 'Pull over and rest'); }
 };
 
@@ -786,3 +805,4 @@ $('talert').onclick = () => post('/api/test-alert');
 
 if __name__ == "__main__":
     main()
+
